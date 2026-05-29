@@ -1,0 +1,861 @@
+## 1. Data Cleaning and Processing
+```{r setup}
+
+# Recommended: run to verify numerical results, figures will look better in knitted document
+
+# Required packages
+library(tidyverse)
+library(knitr)
+library(ggplot2)
+library(scales)
+library(ggrepel)
+
+
+if (!dir.exists("figures")) {
+  dir.create("figures")
+}
+
+knitr::opts_chunk$set(
+  fig.path = "figures/",
+  dev = "png",
+  dpi = 300
+)
+
+
+# Restrict to 1995–2022 and aggregate each player to one AB/H total per season.
+# Then identify each player's first two MLB seasons and construct the dataset.
+
+# We also create a clean player name lookup table from the People file, since the data uses player ids and not plaintext names
+
+# Then, we compute the overall league batting average across all player-seasons in our study period, which will be used as the center of the Beta prior.
+
+# Finally we build our analysis dataset:
+# - keep only first two seasons for each player
+# - sum AB and H over those two seasons
+# - require at least 100 AB total
+# - compute the raw batting average
+
+START_YEAR <- 1995
+END_YEAR   <- 2022
+MIN_AB     <- 100
+
+batting_raw <- read_csv("data/Batting.csv", show_col_types = FALSE)
+people_raw  <- read_csv("data/People.csv",  show_col_types = FALSE)
+```
+
+```{r processing}
+batting <- batting_raw %>%
+  filter(yearID >= START_YEAR, yearID <= END_YEAR) %>%
+  group_by(playerID, yearID) %>%
+  summarise(
+    AB = sum(AB, na.rm = TRUE),
+    H  = sum(H,  na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(AB > 0)
+
+debut <- batting %>%
+  group_by(playerID) %>%
+  summarise(
+    debut_year = min(yearID),
+    .groups = "drop"
+  )
+
+people_names <- people_raw %>%
+  transmute(
+    playerID,
+    name = str_squish(paste(nameFirst, nameLast))
+  )
+
+p_league <- batting %>%
+  summarise(p = sum(H, na.rm = TRUE) / sum(AB, na.rm = TRUE)) %>%
+  pull(p)
+
+two_year <- batting %>%
+  inner_join(debut, by = "playerID") %>%
+  filter(yearID == debut_year | yearID == debut_year + 1) %>%
+  group_by(playerID, debut_year) %>%
+  summarise(
+    AB2 = sum(AB, na.rm = TRUE),
+    H2  = sum(H,  na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(AB2 >= MIN_AB) %>%
+  left_join(people_names, by = "playerID") %>%
+  mutate(
+    ba_raw   = H2 / AB2,
+    p_league = p_league
+  )
+```
+
+## 2. Data Summary
+
+
+```{r cohort-plots, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=6}
+
+# Plot the distribution of total at-bats across the first two seasons, as this helps us understand how much information is available for each player.
+
+ggplot(two_year, aes(x = AB2)) +
+  geom_histogram(
+    bins = 35,
+    fill = "#2C3E50",
+    color = "white",
+    alpha = 0.9
+  ) +
+  labs(
+    title = "Total At-Bats in First Two MLB Seasons",
+    subtitle = "Qualified players (≥ 100 AB)",
+    x = "Total At-Bats (First Two Seasons)",
+    y = "Number of Players"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+
+ba_mean <- mean(two_year$ba_raw)
+
+
+# Plot the distribution of raw batting averages in the filtered cohort.
+# The red dashed line shows the league average, and the navy dotted line shows the cohort mean.
+
+ggplot(two_year, aes(x = ba_raw)) +
+  geom_histogram(
+    binwidth = 0.01,
+    fill = "gray",
+    color = "white",
+    alpha = 0.9
+  ) +
+  geom_vline(
+    xintercept = p_league,
+    color = "red",
+    size = 1.2,
+    linetype = "dashed"
+  ) +
+  geom_vline(
+    xintercept = ba_mean,
+    color = "navy",
+    size = 1.2, 
+    linetype = "dotted"
+  ) +
+  labs(
+    title = "Raw Batting Average (First Two Seasons)",
+    subtitle = "Red dashed = League Average | Navy dotted = Sample Mean",
+    x = "Raw Batting Average",
+    y = "Number of Players"
+  ) +
+  scale_x_continuous(
+    limits = c(0.05, 0.40),
+    breaks = seq(0.05, 0.40, by = 0.05)
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+## 3. Prior and Posterior Specs
+
+We model each player’s true batting ability \( p_i \) using a Binomial likelihood:
+
+\[
+H_i \mid p_i \sim \text{Binomial}(AB_i, p_i)
+\]
+
+We assign a conjugate Beta prior:
+
+\[
+p_i \sim \text{Beta}(\alpha, \beta)
+\]
+
+We center the prior at the historical league batting average and choose a prior strength equivalent to 200 at-bats.
+
+
+```{r posterior-setup}
+
+# Prior parameters, center at league avg. 
+# We chose 200 as this provides a reasonably strong prior, but not one that would outweigh a large enough sample size of excellent (or horrible) performance
+
+# We then compute player-specific posterior parameters using Beta-Binomial conjugacy.
+# Our Posterior mean is the Bayesian shrinkage estimate of true batting ability.
+
+prior_strength <- 200
+
+alpha <- p_league * prior_strength
+beta  <- (1 - p_league) * prior_strength
+
+cat("Alpha:", round(alpha,2), "\n")
+cat("Beta:", round(beta,2), "\n")
+cat("Prior mean:", round(alpha / (alpha + beta),4), "\n")
+cat("Prior strength (alpha+beta):", alpha + beta, "\n\n")
+
+# Posterior parameters for each player
+two_year <- two_year %>%
+  mutate(
+    alpha_post = alpha + H2,
+    beta_post  = beta  + (AB2 - H2),
+    post_mean  = alpha_post / (alpha_post + beta_post)
+  )
+
+two_year %>%
+  select(name, AB2, H2, ba_raw, post_mean) %>%
+  slice_head(n = 10)
+
+```
+
+## 4. Credible Intervals and Probability Above League Avg.
+```{r bayes-inference, echo=FALSE, message=FALSE, warning=FALSE}
+
+# 95% credible intervals for each player's true BA
+two_year <- two_year %>%
+  mutate(
+    ci_low  = qbeta(0.025, alpha_post, beta_post),
+    ci_high = qbeta(0.975, alpha_post, beta_post),
+    ci_width = ci_high - ci_low,
+    
+    # Posterior probability player is above league average 
+    p_above_league = 1 - pbeta(p_league, alpha_post, beta_post)
+  )
+
+cat("Median CI width (95%):", round(median(two_year$ci_width), 4), "\n")
+cat("Mean CI width (95%):", round(mean(two_year$ci_width), 4), "\n\n")
+
+# Players most confidently above league average
+two_year %>%
+  arrange(desc(p_above_league)) %>%
+  select(name, AB2, H2, ba_raw, post_mean, ci_low, ci_high, p_above_league) %>%
+  slice_head(n = 10)
+
+# Players most confidently below league average
+two_year %>%
+  arrange(p_above_league) %>%
+  select(name, AB2, H2, ba_raw, post_mean, ci_low, ci_high, p_above_league) %>%
+  slice_head(n = 10)
+
+```
+
+## 5. Out-of-sample validation
+
+```{r oos-validation, message=FALSE, warning=FALSE, fig.width=10, fig.height=6}
+
+# Here we'll compare the results we obtained via modeling with the actual batting avg. for a player in their 3rd season
+# We compare raw first-two-season BA, Bayesian posterior mean, and league baseline.
+
+# Weighted MSE weights errors by Year-3 at-bats so players with more Year-3 opportunity contribute more to the validation metric.
+
+# Average negative log-likelihood evaluates predictive quality using the full distribution, not just point estimates.
+
+
+stopifnot(all(c("playerID","debut_year","AB2","H2","ba_raw") %in% names(two_year)))
+
+if (!all(c("alpha_post","beta_post","post_mean") %in% names(two_year))) {
+  stop("Run Part 4 first so two_year has alpha_post, beta_post, post_mean.")
+}
+
+log_beta_binom <- function(k, n, a, b) {
+  lchoose(n, k) + lbeta(a + k, b + (n - k)) - lbeta(a, b)
+}
+
+AB3_MIN <- 50
+
+year3 <- batting %>%
+  inner_join(two_year %>% select(playerID, debut_year, ba_raw, post_mean, alpha_post, beta_post), by = "playerID") %>%
+  filter(yearID == debut_year + 2) %>%
+  transmute(
+    playerID, debut_year,
+    AB3 = AB,
+    H3  = H,
+    ba3 = H / AB,
+    ba_raw,
+    post_mean,
+    alpha_post,
+    beta_post
+  ) %>%
+  filter(AB3 >= AB3_MIN)
+
+cat("OOS sample size (players with Year-3 AB >=", AB3_MIN, "):", nrow(year3), "\n\n")
+
+mse_w <- function(y, yhat, w) sum(w * (y - yhat)^2) / sum(w)
+
+mse_raw    <- mse_w(year3$ba3, year3$ba_raw,    year3$AB3)
+mse_bayes  <- mse_w(year3$ba3, year3$post_mean, year3$AB3)
+mse_league <- mse_w(year3$ba3, rep(p_league, nrow(year3)), year3$AB3)
+
+nll_raw <- -mean(dbinom(year3$H3, size = year3$AB3, prob = pmin(pmax(year3$ba_raw, 1e-6), 1 - 1e-6), log = TRUE))
+nll_league <- -mean(dbinom(year3$H3, size = year3$AB3, prob = pmin(pmax(p_league, 1e-6), 1 - 1e-6), log = TRUE))
+nll_bayes <- -mean(log_beta_binom(year3$H3, year3$AB3, year3$alpha_post, year3$beta_post))
+
+results <- tibble::tibble(
+  model = c("League baseline", "Raw first-2yr BA", "Bayes (posterior mean / predictive)"),
+  weighted_mse_ba3 = c(mse_league, mse_raw, mse_bayes),
+  avg_neg_loglik = c(nll_league, nll_raw, nll_bayes)
+) %>%
+  arrange(weighted_mse_ba3)
+
+results
+
+cat("\nRelative improvement vs Raw (weighted MSE): ",
+    round(100 * (mse_raw - mse_bayes) / mse_raw, 2), "%\n", sep="")
+
+cat("Relative improvement vs League (weighted MSE): ",
+    round(100 * (mse_league - mse_bayes) / mse_league, 2), "%\n\n", sep="")
+
+year3 %>%
+  mutate(err_raw = ba3 - ba_raw,
+         err_bayes = ba3 - post_mean) %>%
+  summarise(
+    median_abs_err_raw = median(abs(err_raw)),
+    median_abs_err_bayes = median(abs(err_bayes)),
+    mean_abs_err_raw = mean(abs(err_raw)),
+    mean_abs_err_bayes = mean(abs(err_bayes))
+  )
+
+year3 %>%
+  mutate(delta = abs(ba3 - post_mean) - abs(ba3 - ba_raw)) %>%
+  summarise(
+    pct_bayes_better = mean(delta < 0),
+    pct_tie = mean(delta == 0),
+    pct_raw_better = mean(delta > 0)
+  )
+
+# The shrinkage plot shows how posterior means move toward the league average.
+
+
+ggplot(year3, aes(x = ba_raw, y = post_mean)) +
+  geom_point(
+    color = "#2C3E50",
+    alpha = 0.35,
+    size = 2
+  ) +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "longdash",
+    linewidth = 1,
+    color = "#C0392B"
+  ) +
+  labs(
+    title = "Bayes posterior mean vs raw BA (first 2 qualified seasons)",
+    x = "Raw batting average (first 2 qualified seasons)",
+    y = "Posterior mean batting ability"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray85")
+  )
+
+# The Year-3 histogram shows the distribution of the holdout target (Year 3 Batting Avg.)
+
+ggplot(year3, aes(x = ba3)) +
+  geom_histogram(
+    bins = 35,
+    fill = "#1ABC9C",
+    color = "white",
+    linewidth = 0.3,
+    alpha = 0.9
+  ) +
+  labs(
+    title = "Year-3 batting average",
+    x = "Year-3 batting average (H3 / AB3)",
+    y = "Number of players"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray85")
+  )
+```
+
+## 6. Uncertainty Analysis
+
+
+```{r uncertainty-analysis, message=FALSE, warning=FALSE, fig.width=10, fig.height=6}
+
+# CI width measures posterior uncertainty about true batting ability.
+
+two_year <- two_year %>%
+  mutate(
+    ci_width = ci_high - ci_low
+  )
+
+# Plot CI width against AB2 to show how uncertainty declines as sample size increases.
+ggplot(two_year, aes(x = AB2, y = ci_width)) +
+  geom_point(
+    alpha = 0.3,
+    color = "#2C3E50"
+  ) +
+  geom_smooth(
+    method = "loess",
+    se = FALSE,
+    color = "#C0392B",
+    linewidth = 1.2
+  ) +
+  labs(
+    title = "Credible Interval Width vs Total At-Bats (First Two Seasons)",
+    x = "Total At-Bats (First Two Seasons)",
+    y = "95% Credible Interval Width"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+summary(two_year$ci_width)
+```
+
+
+## 7. Probability Above League Average
+
+
+```{r prob-above, message=FALSE, warning=FALSE, fig.width=10, fig.height=6}
+
+# Plot showing the distribution of posterior probabilities of being above league average.
+
+ggplot(two_year, aes(x = p_above_league)) +
+  geom_histogram(
+    bins = 40,
+    fill = "#1ABC9C",
+    color = "white",
+    alpha = 0.9
+  ) +
+  labs(
+    title = "Posterior Probability of Being Above League Average",
+    x = "P(True BA > League Average)",
+    y = "Number of Players"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+# We also summarize how many players exceed common probability thresholds such as 0.50, 0.75, 0.90, and 0.95.
+two_year %>%
+  summarise(
+    prop_above_50 = mean(p_above_league > 0.5),
+    prop_above_75 = mean(p_above_league > 0.75),
+    prop_above_90 = mean(p_above_league > 0.90),
+    prop_above_95 = mean(p_above_league > 0.95)
+  )
+```
+
+## 8. Posterior Distribution Examples
+
+```{r post-examples, message=FALSE, warning=FALSE, fig.width=10, fig.height=6}
+# Select representative low-, medium-, and high-AB players.
+
+ab_quantiles <- quantile(two_year$AB2, probs = c(0.1, 0.5, 0.9))
+
+rep_players <- two_year %>%
+  arrange(AB2) %>%
+  slice(c(
+    round(0.1 * n()),   
+    round(0.5 * n()),  
+    round(0.9 * n())    
+  )) %>%
+  distinct(playerID, .keep_all = TRUE)
+
+# Generate posterior density curves
+grid <- seq(0.05, 0.40, length.out = 1000)
+
+posterior_curves <- rep_players %>%
+  rowwise() %>%
+  do({
+    data.frame(
+      ba = grid,
+      density = dbeta(grid, .$alpha_post, .$beta_post),
+      name = .$name,
+      AB2 = .$AB2
+    )
+  }) %>%
+  ungroup()
+
+# Plot their posterior Beta densities to illustrate how sample size changes uncertainty.
+
+ggplot(posterior_curves, aes(x = ba, y = density, color = name)) +
+  geom_line(linewidth = 1.2) +
+  geom_vline(xintercept = p_league, linetype = "dashed") +
+  labs(
+    title = "Posterior Beta Distributions (Representative Players)",
+    subtitle = "Low, median, and high at-bat players",
+    x = "True Batting Ability",
+    y = "Posterior Density",
+    color = "Player"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+rep_players %>%
+  select(name, AB2, ba_raw, post_mean, ci_low, ci_high)
+```
+
+## 9. Posterior Predictive
+
+```{r posterior-predictive, message=FALSE, warning=FALSE, fig.width=10, fig.height=6}
+# Draw posterior samples for each player's true batting ability.
+# For each draw, we simulate Year-3 hits from a Binomial model using observed Year-3 AB, we then summarize predictive means and prediction intervals.
+
+# Coverage checks evaluate whether observed Year-3 batting averages fall inside the posterior predictive intervals at around the expected rates.
+
+set.seed(115)
+S <- 2000
+
+pred_dat <- year3 %>%
+  left_join(two_year %>% select(playerID, name, AB2), by = "playerID") %>%
+  filter(AB3 > 0) %>%
+  select(playerID, name, AB2, AB3, ba3, alpha_post, beta_post)
+
+p_draws <- matrix(
+  rbeta(nrow(pred_dat) * S, pred_dat$alpha_post, pred_dat$beta_post),
+  nrow = nrow(pred_dat),
+  ncol = S
+)
+
+h3_draws <- matrix(
+  rbinom(nrow(pred_dat) * S, size = pred_dat$AB3, prob = as.vector(p_draws)),
+  nrow = nrow(pred_dat),
+  ncol = S
+)
+
+ba3_pred_draws <- h3_draws / pred_dat$AB3
+
+pred_summ <- pred_dat %>%
+  mutate(
+    pred_mean = rowMeans(ba3_pred_draws),
+    pi80_low  = apply(ba3_pred_draws, 1, quantile, probs = 0.10),
+    pi80_high = apply(ba3_pred_draws, 1, quantile, probs = 0.90),
+    pi95_low  = apply(ba3_pred_draws, 1, quantile, probs = 0.025),
+    pi95_high = apply(ba3_pred_draws, 1, quantile, probs = 0.975),
+    err_pred  = ba3 - pred_mean
+  )
+
+
+cat("Mean squared error (pred_mean vs observed ba3):",
+    round(mean(pred_summ$err_pred^2, na.rm = TRUE), 6), "\n\n")
+
+cov80 <- mean(pred_summ$ba3 >= pred_summ$pi80_low & pred_summ$ba3 <= pred_summ$pi80_high, na.rm = TRUE)
+cov95 <- mean(pred_summ$ba3 >= pred_summ$pi95_low & pred_summ$ba3 <= pred_summ$pi95_high, na.rm = TRUE)
+
+cat("Coverage (80% PI):", round(cov80, 3), "\n")
+cat("Coverage (95% PI):", round(cov95, 3), "\n\n")
+
+ggplot(pred_summ, aes(x = pred_mean, y = ba3)) +
+  geom_point(alpha = 0.35) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(
+    title = "Posterior predictive mean vs observed Year-3 batting average",
+    x = "Posterior predictive mean (Year 3 BA)",
+    y = "Observed Year-3 batting average (H3 / AB3)"
+  ) +
+  theme_minimal(base_size = 14)
+
+ggplot(pred_summ, aes(x = err_pred)) +
+  geom_histogram(bins = 40) +
+  labs(
+    title = "Posterior predictive errors (Observed BA3 - Predicted mean)",
+    x = "Prediction error",
+    y = "Number of players"
+  ) +
+  theme_minimal(base_size = 14)
+
+pred_summ %>%
+  mutate(pi95_width = pi95_high - pi95_low) %>%
+  arrange(desc(pi95_width)) %>%
+  select(name, AB2, AB3, ba3, pred_mean, pi80_low, pi80_high, pi95_low, pi95_high, pi95_width) %>%
+  slice_head(n = 10)
+
+```
+
+## 10. Prior Sensitivity Analysis
+
+```{r prior-sensitivity, message=FALSE, warning=FALSE, fig.width=10, fig.height=6}
+
+## Refit the model under alternative prior strengths and compare key conclusions
+# This checks whether the main conclusions depend strongly on our chosen prior strength.
+
+# We then compare predictive performance, interval width, and posterior probabilities across prior strengths.
+
+prior_grid <- c(50, 100, 200, 400)
+
+sensitivity_results <- map_dfr(prior_grid, function(ps) {
+  
+  alpha_s <- p_league * ps
+  beta_s  <- (1 - p_league) * ps
+  
+  tmp <- two_year %>%
+    transmute(
+      playerID,
+      name,
+      AB2,
+      H2,
+      ba_raw,
+      alpha_post = alpha_s + H2,
+      beta_post  = beta_s + (AB2 - H2),
+      post_mean  = alpha_post / (alpha_post + beta_post),
+      ci_low     = qbeta(0.025, alpha_post, beta_post),
+      ci_high    = qbeta(0.975, alpha_post, beta_post),
+      ci_width   = ci_high - ci_low,
+      p_above_league = 1 - pbeta(p_league, alpha_post, beta_post)
+    )
+  
+  year3_tmp <- batting %>%
+    inner_join(
+      two_year %>% select(playerID, debut_year),
+      by = "playerID"
+    ) %>%
+    filter(yearID == debut_year + 2) %>%
+    transmute(
+      playerID,
+      AB3 = AB,
+      H3  = H,
+      ba3 = H / AB
+    ) %>%
+    filter(AB3 >= AB3_MIN)
+  
+  valid_tmp <- tmp %>%
+    inner_join(year3_tmp, by = "playerID") %>%
+    mutate(
+      sq_err = (ba3 - post_mean)^2
+    )
+  
+  tibble(
+    prior_strength = ps,
+    prior_mean = alpha_s / (alpha_s + beta_s),
+    mean_post_mean = mean(tmp$post_mean),
+    median_ci_width = median(tmp$ci_width),
+    prop_above_50 = mean(tmp$p_above_league > 0.5),
+    prop_above_90 = mean(tmp$p_above_league > 0.9),
+    weighted_mse_ba3 = sum(valid_tmp$AB3 * valid_tmp$sq_err) / sum(valid_tmp$AB3)
+  )
+})
+
+sensitivity_results
+
+ggplot(sensitivity_results, aes(x = prior_strength, y = weighted_mse_ba3)) +
+  geom_line(linewidth = 1, color = "#2C3E50") +
+  geom_point(size = 3, color = "#C0392B") +
+  scale_x_continuous(breaks = prior_grid) +
+  labs(
+    title = "Sensitivity of Year-3 Prediction Error to Prior Strength",
+    x = "Prior strength (effective AB)",
+    y = "Weighted MSE for Year-3 BA"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+ggplot(sensitivity_results, aes(x = prior_strength, y = median_ci_width)) +
+  geom_line(linewidth = 1, color = "#1ABC9C") +
+  geom_point(size = 3, color = "#2C3E50") +
+  scale_x_continuous(breaks = prior_grid) +
+  labs(
+    title = "Sensitivity of Median Credible Interval Width to Prior Strength",
+    x = "Prior strength (effective AB)",
+    y = "Median 95% credible interval width"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+# Example player-level comparison under different priors
+example_players <- c("rookebr01", "sotoju01", "heywaja01")
+
+player_sensitivity <- map_dfr(prior_grid, function(ps) {
+  alpha_s <- p_league * ps
+  beta_s  <- (1 - p_league) * ps
+  
+  two_year %>%
+    filter(playerID %in% example_players) %>%
+    transmute(
+      playerID,
+      name,
+      prior_strength = ps,
+      AB2,
+      ba_raw,
+      post_mean = (alpha_s + H2) / (alpha_s + beta_s + AB2)
+    )
+})
+
+player_sensitivity %>%
+  arrange(name, prior_strength)
+
+ggplot(player_sensitivity, aes(x = prior_strength, y = post_mean, color = name)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  scale_x_continuous(breaks = prior_grid) +
+  labs(
+    title = "Sensitivity of Posterior Means for Example Players",
+    x = "Prior strength (effective AB)",
+    y = "Posterior mean batting ability",
+    color = "Player"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+```{r famous-player-check, message=FALSE, warning=FALSE}
+# Chosen famous players for additional visualizations, with a mix of some of the most touted prospects ever like Judge and Harper, and several "lesser known" players at the time of their major league debuts like Chapman, Olson and Marte
+famous_players <- c(
+  "Ichiro Suzuki", "Aaron Judge", "Juan Soto", "Mookie Betts",
+  "Freddie Freeman", "Albert Pujols",
+  "Shohei Ohtani", "Ketel Marte", "Mike Trout", "David Ortiz",
+  "Cody Bellinger", "Matt Olson", "Matt Chapman",
+  "Bryce Harper"
+)
+
+two_year %>%
+  filter(name %in% famous_players) %>%
+  select(name, debut_year, AB2, H2, ba_raw, post_mean, p_above_league) %>%
+  arrange(desc(AB2))
+
+```
+
+```{r famous-shrinkage-plot, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=6}
+# This section is just for fun, and features some MLB stars
+# A notable outlier is Shohei Ohtani, which is explained by the fact that his career worst .190 batting average came in the covid-19 shortened 2020 seaso
+famous_subset <- two_year %>%
+  filter(name %in% famous_players)
+
+ggplot(two_year, aes(x = ba_raw, y = post_mean)) +
+  geom_point(
+    color = "gray70",
+    alpha = 0.35,
+    size = 1.8
+  ) +
+  geom_point(
+    data = famous_subset,
+    color = "#C0392B",
+    size = 2.8
+  ) +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed",
+    linewidth = 1,
+    color = "black"
+  ) +
+  geom_text_repel(
+    data = famous_subset,
+    aes(label = name),
+    size = 3.5,
+    max.overlaps = 30,
+    box.padding = 0.3,
+    point.padding = 0.2
+  ) +
+  labs(
+    title = "Bayesian shrinkage for selected MLB stars",
+    x = "Raw batting average (first two seasons)",
+    y = "Posterior mean batting ability"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+  
+```
+
+
+```{r famous-predictive-intervals, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=6}
+
+famous_subset_pred <- pred_summ %>%
+  filter(name %in% famous_players)
+
+ggplot(
+  famous_subset_pred,
+  aes(x = reorder(name, pred_mean), y = pred_mean)
+) +
+  geom_point(
+    color = "#2C3E50",
+    size = 3
+  ) +
+  geom_errorbar(
+    aes(ymin = pi80_low, ymax = pi80_high),
+    width = 0.2,
+    color = "#1ABC9C",
+    linewidth = 1.2
+  ) +
+  geom_point(
+    aes(y = ba3),
+    color = "#C0392B",
+    size = 3
+  ) +
+  coord_flip(clip = "off") +
+  labs(
+    title = str_wrap("Posterior predictive intervals for selected MLB stars", width = 40),
+    subtitle = str_wrap("Blue = predicted mean, green bars = 80% interval, red = observed Year-3 BA", width = 55),
+    x = "Player Name",
+    y = "Batting Average"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    plot.margin = margin(15, 50, 15, 50)
+  )
+```
+
+## 11. Results and Conclusions
+```{r results, echo=FALSE, message=FALSE, warning=FALSE}
+results_summary <- tibble(
+  Result = c(
+    "Bayesian shrinkage improves predictive accuracy for Year 3 batting averages",
+    "Players with fewer at-bats have stronger shrinkage toward the league average",
+    "Credible interval width decreases as total at-bats increase",
+    "Our main conclusions remain stable across different prior strengths"
+  ),
+  Explanation = c(
+    "Posterior mean batting ability had lower prediction error for Year-3 performance compared to raw batting averages.",
+    "Less data leads to more uncertainty, so estimates are pulled toward the prior (which we centered around the league average).",
+    "Follows from our previous finding; more observations = more information about true batting ability, reducing posterior uncertainty.",
+    "The sensitivity analysis showed that changing the prior strength does not significantly change our main conclusions."
+  )
+)
+
+
+
+
+# Additional high-level metrics from the analysis
+
+summary_metrics <- tibble(
+  Metric = c(
+    "League batting average (prior center)",
+    "Median credible interval width",
+    "Mean credible interval width",
+    "Players with >50% probability above league average",
+    "Players with >90% probability above league average"
+  ),
+  Value = c(
+    round(p_league, 4),
+    round(median(two_year$ci_width), 4),
+    round(mean(two_year$ci_width), 4),
+    round(mean(two_year$p_above_league > 0.5), 3),
+    round(mean(two_year$p_above_league > 0.9), 3)
+  )
+)
+
+knitr::kable(results_summary)
+knitr::kable(summary_metrics)
+
+
+cat("\nLimitations and possible extensions:\n")
+cat("In this project, we assume that batting ability is  stable across early seasons and we don't account for factors like rule changes, player position changes, injuries, age, etc..\n")
+cat("If we had more time and data, we'd enact several changes. Firstly, batting average is an inherently flawed 'one stat' metrics for measuring batting ability, as it lacks context for things like walks, extra-base hits, and so on. We would use a stat like OPS+, wRC+ or even f/bWAR as those are more holistic measurements of a players offensive value, which is the goal of the project. Additonally, we'd add far more features to the model, to account for things like positional difference (ie catchers are expected to hit worse than 1st basemen), age, league run environment and so on.\n")
+```
